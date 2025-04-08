@@ -23,7 +23,7 @@ class PositionEmbedding(nn.Module):
                  embedding_dim,
                  mode=MODE_ADD):
         super(PositionEmbedding, self).__init__()
-        self.num_embeddings = num_embeddings  # 每一row資料有多長
+        self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.mode = mode
         if self.mode == self.MODE_EXPAND:
@@ -194,7 +194,32 @@ class LastAttenion(Module):
         alpha = torch.softmax(alpha, dim=-1)
 
         if self.use_attn_conv == "True":
-            pass  # Сверточное внимание пока не реализовано
+            # Преобразуем alpha для LPPooling
+            alpha_reshaped = alpha.view(-1, alpha.size(-2), alpha.size(-1))  # [batch * heads, seq_len, seq_len]
+
+            # Применяем LPPool1d
+            pool = torch.nn.LPPool1d(self.l_p, self.last_k, stride=self.last_k)
+            alpha_pooled = pool(alpha_reshaped)  # [batch * heads, seq_len, pooled_len]
+
+            # Восстановим размерность после pooling
+            pooled_len = alpha_pooled.size(-1)
+            alpha = alpha_pooled.view(batch_size, self.heads, seq_len, pooled_len)
+
+            # Приведение маски к нужной форме
+            extended_mask = mask[:, :seq_len].unsqueeze(1).unsqueeze(-1)  # [batch, 1, seq_len, 1]
+            alpha = alpha * extended_mask  # Применяем маску
+
+            # Нормализация
+            alpha = torch.softmax(alpha, dim=-1)
+
+            # Обновление q2, чтобы он соответствовал pooled_len
+            q2 = q2[..., -pooled_len:, :]  # Обрезаем последние pooled_len элементов
+
+            # Применение внимания
+            out = torch.matmul(alpha, q2)
+        else:
+            # Применение обычного внимания
+            out = torch.matmul(alpha, q2)
 
         out = torch.matmul(alpha, q2)
         out = out.permute(0, 2, 1, 3).contiguous()

@@ -33,7 +33,7 @@ print(opt)
 
 def main():
     train_data = pickle.load(
-        open('D:/python_practice/GC-SAN-AM_step_by_step/datasets/' + opt.dataset + '/train.txt', 'rb'))
+        open('D:/python_practice/AM-GNN/datasets/' + opt.dataset + '/train.txt', 'rb'))
     if opt.validation:
         train_data, valid_data = split_validation(train_data, opt.valid_portion)
         test_data = valid_data
