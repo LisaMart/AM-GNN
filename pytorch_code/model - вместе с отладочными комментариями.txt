@@ -1,0 +1,696 @@
+#!/usr/bin/env python36
+# -*- coding: utf-8 -*-
+
+import datetime
+import math
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import Module, Parameter
+import torch.nn.functional as F
+from torchsummary import summary
+
+K = 5
+
+class PositionEmbedding(nn.Module):
+
+    MODE_EXPAND = 'MODE_EXPAND'
+    MODE_ADD = 'MODE_ADD'
+    MODE_CONCAT = 'MODE_CONCAT'
+
+    def __init__(self,
+                 num_embeddings,
+                 embedding_dim,
+                 mode=MODE_ADD):
+        super(PositionEmbedding, self).__init__()
+        self.num_embeddings = num_embeddings  # 每一row資料有多長
+        self.embedding_dim = embedding_dim
+        self.mode = mode
+        if self.mode == self.MODE_EXPAND:
+            self.weight = nn.Parameter(torch.Tensor(num_embeddings * 2 + 1, embedding_dim))
+        else:
+            self.weight = nn.Parameter(torch.Tensor(num_embeddings, embedding_dim))
+        # self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.xavier_normal_(self.weight)
+
+    def forward(self, x):
+        if self.mode == self.MODE_EXPAND:
+            indices = torch.clamp(x, -self.num_embeddings, self.num_embeddings) + self.num_embeddings
+            return F.embedding(indices.type(torch.LongTensor), self.weight)
+        batch_size, seq_len = x.size()[:2]
+        embeddings = self.weight[:seq_len, :].view(1, seq_len, self.embedding_dim)
+        if self.mode == self.MODE_ADD:
+            return x + embeddings
+        if self.mode == self.MODE_CONCAT:
+            return torch.cat((x, embeddings.repeat(batch_size, 1, 1)), dim=-1)
+        raise NotImplementedError('Unknown mode: %s' % self.mode)
+
+    def extra_repr(self):
+        return 'num_embeddings={}, embedding_dim={}, mode={}'.format(
+            self.num_embeddings, self.embedding_dim, self.mode,
+        )
+
+class Residual(Module):
+    def __init__(self):
+        super().__init__()
+        self.hidden_size = 120
+        self.d1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.d2 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.dp = nn.Dropout(p=0.2)
+        self.drop = True
+
+    def forward(self, x):
+        residual = x  # keep original input
+        x = F.relu(self.d1(x))
+        if self.drop:
+            x = self.d2(self.dp(x))
+        else:
+            x = self.d2(x)
+        out = residual + x
+        return out
+
+class MultiHeadedAttention(nn.Module): # Этот слой используется для обработки взаимозависимостей между элементами данных с применением нескольких голов внимания (multi-head). Это стандартный слой, который может работать на уровне сессий или пользователей.
+    """Multi-Head Attention layer
+
+    :param int n_head: the number of head s
+    :param int n_feat: the number of features
+    :param float dropout_rate: dropout rate
+    """
+
+    def __init__(self, n_head, n_feat, dropout_rate):
+        super(MultiHeadedAttention, self).__init__()
+        assert n_feat % n_head == 0
+        # We assume d_v always equals d_k
+        self.d_k = n_feat // n_head
+        self.h = n_head
+        self.linear_q = nn.Linear(n_feat, n_feat)
+        self.linear_k = nn.Linear(n_feat, n_feat)
+        self.linear_v = nn.Linear(n_feat, n_feat)
+        self.linear_out = nn.Linear(n_feat, n_feat)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout_rate)
+
+    def forward(self, query, key, value, mask):
+        """Compute 'Scaled Dot Product Attention'
+
+        :param torch.Tensor query: (batch, time1, size)
+        :param torch.Tensor key: (batch, time2, size)
+        :param torch.Tensor value: (batch, time2, size)
+        :param torch.Tensor mask: (batch, time1, time2)
+        :param torch.nn.Dropout dropout:
+        :return torch.Tensor: attentined and transformed `value` (batch, time1, d_model)
+             weighted by the query dot key attention (batch, head, time1, time2)
+        """
+        n_batch = query.size(0)
+        q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
+        k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k)
+        v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k)
+        q = q.transpose(1, 2)  # (batch, head, time1, d_k)
+        k = k.transpose(1, 2)  # (batch, head, time2, d_k)
+        v = v.transpose(1, 2)  # (batch, head, time2, d_k)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)  # (batch, head, time1, time2)
+        if mask is not None:
+            mask = mask.unsqueeze(1).eq(0)  # (batch, 1, time1, time2)
+            min_value = float(np.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min)
+            # scores = scores.masked_fill(mask, min_value)
+            self.attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)  # (batch, head, time1, time2)
+        else:
+            self.attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
+
+        p_attn = self.dropout(self.attn)
+        x = torch.matmul(p_attn, v)  # (batch, head, time1, d_k)
+        x = x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
+        return self.linear_out(x)  # (batch, time1, d_model)
+
+class GNN(Module):
+    def __init__(self, hidden_size, step=1):
+        super(GNN, self).__init__()
+        self.step = step
+        self.hidden_size = hidden_size
+        self.input_size = hidden_size * 2
+        self.gate_size = 3 * hidden_size
+        self.w_ih = Parameter(torch.Tensor(self.gate_size, self.input_size))
+        self.w_hh = Parameter(torch.Tensor(self.gate_size, self.hidden_size))
+        self.b_ih = Parameter(torch.Tensor(self.gate_size))
+        self.b_hh = Parameter(torch.Tensor(self.gate_size))
+        self.b_iah = Parameter(torch.Tensor(self.hidden_size))
+        self.b_oah = Parameter(torch.Tensor(self.hidden_size))
+
+        self.linear_edge_in = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_edge_out = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_edge_f = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+
+    def GNNCell(self, A, hidden):
+        input_in = torch.matmul(A[:, :, :A.shape[1]], self.linear_edge_in(hidden)) + self.b_iah
+        input_out = torch.matmul(A[:, :, A.shape[1]: 2 * A.shape[1]], self.linear_edge_out(hidden)) + self.b_oah
+        inputs = torch.cat([input_in, input_out], 2)
+        gi = F.linear(inputs, self.w_ih, self.b_ih)
+        gh = F.linear(hidden, self.w_hh, self.b_hh)
+        i_r, i_i, i_n = gi.chunk(3, 2)
+        h_r, h_i, h_n = gh.chunk(3, 2)
+        resetgate = torch.sigmoid(i_r + h_r)
+        inputgate = torch.sigmoid(i_i + h_i)
+        newgate = torch.tanh(i_n + resetgate * h_n)
+        # hy = newgate + inputgate * (hidden - newgate)
+        hy = hidden - inputgate * (hidden - newgate)
+        return hy
+
+    def forward(self, A, hidden):
+        for i in range(self.step):
+            hidden = self.GNNCell(A, hidden)
+        return hidden
+
+"""class LastAttenion(Module): # Это специализированный слой, который применяет внимание только на последних шагах (или последних элементах), чтобы выделить наиболее важные элементы в сессии.
+    def __init__(self, hidden_size, heads, dot, l_p, last_k=3, use_attn_conv=False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.heads = heads
+        self.last_k = last_k
+        self.linear_zero = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_one = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_two = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_three = nn.Linear(self.hidden_size, self.heads, bias=False)
+        self.linear_four = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.linear_five = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.dropout = 0.1
+        self.dot = dot
+        self.l_p = l_p
+        self.use_attn_conv = use_attn_conv
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for weight in self.parameters():
+            weight.data.normal_(std=0.1)
+
+    def forward(self, ht1, hidden, mask):
+        q0 = self.linear_zero(ht1).view(-1, ht1.size(1), self.hidden_size // self.heads)
+        q1 = self.linear_one(hidden).view(-1, hidden.size(1), self.hidden_size // self.heads)
+        q2 = self.linear_two(hidden).view(-1, hidden.size(1), self.hidden_size // self.heads)
+
+        alpha = torch.sigmoid(torch.matmul(q0, q1.permute(0, 2, 1)))
+        alpha = alpha.view(-1, q0.size(1) * self.heads, hidden.size(1)).permute(0, 2, 1)
+        alpha = torch.softmax(2 * alpha, dim=1)
+
+        if self.use_attn_conv == "True":
+            m = torch.nn.LPPool1d(self.l_p, self.last_k, stride=self.last_k)
+            alpha = m(alpha)
+            alpha = torch.masked_fill(alpha, ~mask.bool().unsqueeze(-1), float('-inf'))
+            alpha = torch.softmax(2 * alpha, dim=1)
+
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        a = torch.sum(
+            (alpha.unsqueeze(-1) * q2.view(hidden.size(0), -1, self.heads, self.hidden_size // self.heads)).view(
+                hidden.size(0), -1, self.hidden_size) * mask.view(mask.shape[0], -1, 1).float(), 1)
+        return a, alpha"""
+
+class LastAttenion(Module):
+    def __init__(self, hidden_size, heads, dot, l_p, last_k=3, use_attn_conv=False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.heads = heads
+        self.last_k = last_k
+        self.linear_zero = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_one = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_two = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_three = nn.Linear(self.hidden_size, self.heads, bias=False)
+        self.linear_four = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.linear_five = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.dropout = 0.1
+        self.dot = dot
+        self.l_p = l_p
+        self.use_attn_conv = use_attn_conv
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for weight in self.parameters():
+            weight.data.normal_(std=0.1)
+
+    # ВМЕСТЕ С ОТЛАДКОЙ
+#    def forward(self, ht1, hidden, mask):
+#        batch_size, seq_len, _ = hidden.size()
+#        print(f"[Debug] hidden: {hidden.shape}")  # [50, 6, 120]
+#
+#        #q0 = self.linear_zero(ht1).view(-1, ht1.size(1), self.hidden_size // self.heads)
+#        #q1 = self.linear_one(hidden).view(-1, hidden.size(1), self.hidden_size // self.heads)
+#        #q2 = self.linear_two(hidden).view(-1, hidden.size(1), self.hidden_size // self.heads)
+#
+#        # linear -> [batch, seq_len, hidden] → view → [batch, seq_len, heads, dim_per_head] → permute
+#        q0 = self.linear_zero(ht1).view(batch_size, seq_len, self.heads, -1).permute(0, 2, 1, 3)
+#        q1 = self.linear_one(hidden).view(batch_size, seq_len, self.heads, -1).permute(0, 2, 1, 3)
+#        q2 = self.linear_two(hidden).view(batch_size, seq_len, self.heads, -1).permute(0, 2, 1, 3)
+#
+#        print(f"[Debug] q0 shape: {q0.shape}")  # [50, 8, 6, 15]
+#        print(f"[Debug] q1 shape: {q1.shape}")  # [50, 8, 6, 15]
+#        print(f"[Debug] q2 shape: {q2.shape}")
+#
+#        #alpha = torch.sigmoid(torch.matmul(q0, q1.permute(0, 2, 1)))
+#        #alpha = alpha.view(-1, q0.size(1) * self.heads, hidden.size(1)).permute(0, 2, 1)
+#        #alpha = torch.softmax(2 * alpha, dim=1)
+#
+#        # Внимание: матричное произведение → [batch, heads, seq_len, seq_len]
+#        alpha = torch.matmul(q0, q1.transpose(-1, -2)) / (q0.size(-1) ** 0.5)
+#        print(f"[Debug] alpha raw: {alpha.shape}")  # [50, 8, 6, 6]
+#
+#        alpha = torch.softmax(alpha, dim=-1)
+#        print(f"[Debug] alpha softmax: {alpha.shape}")  # [50, 8, 6, 6]
+#
+##        if self.use_attn_conv == "True":
+##            m = torch.nn.LPPool1d(self.l_p, self.last_k, stride=self.last_k)
+##            alpha = m(alpha)
+##            print(f"alpha shape after convolution: {alpha.shape}")
+##
+##            alpha = torch.masked_fill(alpha, ~mask.bool().unsqueeze(-1), float('-inf'))
+##            print(f"alpha shape after mask application: {alpha.shape}")
+##
+##            alpha = torch.softmax(2 * alpha, dim=1)
+##            print(f"alpha shape after second softmax: {alpha.shape}")
+##
+##        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+##        print(f"alpha shape after dropout: {alpha.shape}")
+##
+##        a = torch.sum(
+##            (alpha.unsqueeze(-1) * q2.view(hidden.size(0), -1, self.heads, self.hidden_size // self.heads)).view(
+##                hidden.size(0), -1, self.hidden_size) * mask.view(mask.shape[0], -1, 1).float(), 1
+##        )
+##        print(f"a shape before return: {a.shape}")
+#
+#        if self.use_attn_conv == "True":
+#            # TODO: сверточный attention пока пропускаем
+#            pass
+#
+#        # Применение внимания
+#        out = torch.matmul(alpha, q2)  # [50, 8, 6, 15]
+#        out = out.permute(0, 2, 1, 3).contiguous()  # → [50, 6, 8, 15]
+#        out = out.view(batch_size, seq_len, -1)  # → [50, 6, 120]
+#        print(f"[Debug] out after attention: {out.shape}")
+#
+#        # Приводим маску к правильной размерности
+#        print(f"[Debug] mask before expansion: {mask.shape}")  # [50, 16]
+#
+#        mask = mask[:, :seq_len]  # → [50, 6]
+#        mask = mask.unsqueeze(-1)  # → [50, 6, 1]
+#        print(f"[Debug] mask after unsqueeze: {mask.shape}")  # [50, 6, 1]
+#
+#        mask = mask.expand(-1, out.size(1), out.size(2))  # [50, 6, 120]
+#        print(f"[Debug] mask after expansion: {mask.shape}")
+#
+#        out = out * mask  # Маска применена к out
+#        print(f"[Debug] out after applying mask: {out.shape}")  # Проверка
+#
+#        a = out.sum(dim=1)  # Аггрегация по seq_len → [50, 120]
+#        print(f"[Debug] a after sum: {a.shape}")
+#
+#        return a, alpha
+
+    def forward(self, ht1, hidden, mask): # CLEAN VERSION
+        batch_size, seq_len, _ = hidden.size()
+
+        q0 = self.linear_zero(ht1).view(batch_size, seq_len, self.heads, -1).permute(0, 2, 1, 3)
+        q1 = self.linear_one(hidden).view(batch_size, seq_len, self.heads, -1).permute(0, 2, 1, 3)
+        q2 = self.linear_two(hidden).view(batch_size, seq_len, self.heads, -1).permute(0, 2, 1, 3)
+
+        alpha = torch.matmul(q0, q1.transpose(-1, -2)) / (q0.size(-1) ** 0.5)
+        alpha = torch.softmax(alpha, dim=-1)
+
+        if self.use_attn_conv == "True":
+            pass  # Сверточное внимание пока не реализовано
+
+        out = torch.matmul(alpha, q2)
+        out = out.permute(0, 2, 1, 3).contiguous()
+        out = out.view(batch_size, seq_len, -1)
+
+        mask = mask[:, :seq_len]
+        mask = mask.unsqueeze(-1)
+        mask = mask.expand(-1, out.size(1), out.size(2))
+
+        out = out * mask
+        a = out.sum(dim=1)
+
+        return a, alpha
+
+class SessionGraph(Module):
+    def __init__(self, opt, n_node, len_max):
+        super(SessionGraph, self).__init__()
+        self.hidden_size = opt.hiddenSize
+        self.len_max = len_max # Максимальная длина для позиционного кодирования
+        self.n_node = n_node
+        self.batch_size = opt.batchSize
+        self.num_heads = opt.heads # new - добавляем количество голов head
+        self.nonhybrid = opt.nonhybrid
+        self.embedding = nn.Embedding(self.n_node, self.hidden_size)
+        self.gnn = GNN(self.hidden_size, step=opt.step)
+
+        self.attn = LastAttenion(self.hidden_size, self.num_heads, opt.dot, opt.l_p, last_k=opt.last_k, use_attn_conv=opt.use_attn_conv)# Инициализация слоя внимания LastAttenion
+
+        self.linear_one = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_two = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_three = nn.Linear(self.hidden_size, 1, bias=False)
+        self.linear_transform = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=True)
+        self.rn = Residual()
+        self.multihead_attn = nn.MultiheadAttention(self.hidden_size, 1).cuda()
+        # self.multihead_attn = MultiHeadedAttention(4, self.hidden_size, 0.2).cuda()
+        self.pe = PositionEmbedding(len_max, self.hidden_size)
+        self.loss_function = nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for weight in self.parameters():
+            weight.data.uniform_(-stdv, stdv)
+
+#    def compute_scores(self, hidden, mask, self_att=True, residual=True, k_blocks=4):
+#        ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
+#        mask_self = mask.repeat(1, mask.shape[1]).view(-1, mask.shape[1], mask.shape[1])
+#        if self_att:
+#            # 加上 self attention
+#            attn_output = hidden
+#            for k in range(k_blocks):
+#                attn_output = attn_output.transpose(0,1)
+#                attn_output, attn_output_weights = self.multihead_attn(attn_output, attn_output, attn_output)
+#                # fixme 加上 mask會train壞掉
+#                # attn_output = self.multihead_attn(attn_output, attn_output, attn_output, mask_self)  # 加上mask
+#                attn_output = attn_output.transpose(0,1)
+#                # 加上 residual network
+#                if residual:
+#                    attn_output = self.rn(attn_output)
+#            hn = attn_output[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # use last one as global interest
+#            # a = hn + ht  # consider current interest
+#            a = 0.52*hn + (1-0.52)*ht  # hyper-parameter w
+#        else:
+#            # attention with ht as query
+#            q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # batch_size x 1 x latent_size
+#            q2 = self.linear_two(hidden)  # batch_size x seq_length x latent_size
+#            alpha = self.linear_three(torch.sigmoid(q1 + q2))
+#            a = torch.sum(alpha * hidden * mask.view(mask.shape[0], -1, 1).float(), 1)
+#            if not self.nonhybrid:
+#                a = self.linear_transform(torch.cat([a, ht], 1))
+#
+#        b = self.embedding.weight[1:]  # n_nodes x latent_size
+#        scores = torch.matmul(a, b.transpose(1, 0))
+#        return scores
+
+#    def forward(self, inputs, A): - forward до того, как добавили LastAttention
+#        hidden = self.embedding(inputs)
+#        hidden = self.gnn(A, hidden)
+#        return hidden
+
+    """def compute_scores(self, hidden, mask, self_att=True, residual=True, k_blocks=4):
+        # Выбор скрытого состояния для текущего элемента
+        ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
+        # При необходимости создаём маску для самовнимания (это не обязательно, если используется attention слой)
+        mask_self = mask.repeat(1, mask.shape[1]).view(-1, mask.shape[1], mask.shape[1])
+        
+        if self_att:
+            # Применение слоя внимания LastAttenion
+            attn_output = hidden
+            for k in range(k_blocks):
+                attn_output = attn_output.transpose(0, 1)  # Перестановка для корректной работы multihead attention
+                attn_output, attn_weights = self.attn(attn_output, attn_output, mask)  # Применение слоя LastAttenion
+                attn_output = attn_output.transpose(0, 1)  # Восстановление исходной размерности
+                # Применение residual network
+                if residual:
+                    attn_output = self.rn(attn_output)
+            # Используем последние скрытые состояния после применения внимания
+            hn = attn_output[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # Используем последнее состояние как глобальный интерес
+            # Комбинируем скрытые состояния с результатом внимания (гиперпараметр w определяет вес)
+            a = 0.52 * hn + (1 - 0.52) * ht  # hyper-parameter w
+        else:
+            # Когда attention не применяется, обычное внимание с использованием текущего интереса
+            q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # batch_size x 1 x latent_size
+            q2 = self.linear_two(hidden)  # batch_size x seq_length x latent_size
+            alpha = self.linear_three(torch.sigmoid(q1 + q2))
+            a = torch.sum(alpha * hidden * mask.view(mask.shape[0], -1, 1).float(), 1)
+            if not self.nonhybrid:
+                a = self.linear_transform(torch.cat([a, ht], 1))
+        
+        # Переход от скрытых состояний к прогнозируемым оценкам
+        b = self.embedding.weight[1:]  # n_nodes x latent_size
+        scores = torch.matmul(a, b.transpose(1, 0))  # Оценки (предсказания)
+        return scores"""
+    # ВМЕСТЕ С ОТЛАДКОЙ
+    """def compute_scores(self, hidden, mask, self_att=True, residual=True, k_blocks=4):
+        print(f"[Debug] compute_scores - mask shape: {mask.shape}")
+        print(f"[Debug] compute_scores - hidden shape: {hidden.shape}")
+
+        # Получаем последний индекс активного элемента
+        idx = torch.sum(mask, dim=1) - 1 # Индекс последнего элемента в каждой последовательности
+        print(f"[Debug] raw idx before clamp: {idx}")
+        idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)   # Защита от выхода за границу
+        print(f"[Debug] clamped idx: {idx}")
+        # Получаем последнее скрытое состояние (текущее намерение пользователя)
+        #ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # [batch_size, hidden_size]
+        ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden_size]
+
+        if self_att:
+
+            a, alpha = self.attn(hidden, hidden, mask)  # a: [batch_size, hidden_size]; Применяем LastAttenion один раз
+            a = 0.52 * a + (1 - 0.52) * ht  # w = 0.52 — гиперпараметр; Комбинируем локальное и глобальное представления
+        else:
+            # Вариант без внимания (оригинальный GC-SAN)
+            q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # [batch, 1, hidden]
+            q2 = self.linear_two(hidden)  # [batch, seq_len, hidden]
+            alpha = self.linear_three(torch.sigmoid(q1 + q2))  # [batch, seq_len, 1]
+            #a = torch.sum(alpha * hidden * mask.view(mask.shape[0], -1, 1).float(), dim=1)  # [batch, hidden]
+            mask_expanded = mask.view(mask.shape[0], -1, 1).float()
+            a = torch.sum(alpha * hidden * mask_expanded, dim=1)
+
+            if not self.nonhybrid:
+                a = self.linear_transform(torch.cat([a, ht], dim=1))  # [batch, hidden]
+
+        # Прогноз: [batch, n_nodes - 1]
+        b = self.embedding.weight[1:]  # [n_nodes - 1, hidden]
+        scores = torch.matmul(a, b.transpose(1, 0))  # [batch, n_nodes - 1]
+
+        return scores"""
+
+    # CLEAN VERSION
+    def compute_scores(self, hidden, mask, self_att=True, residual=True, k_blocks=4):
+        # Получаем последний индекс активного элемента
+        idx = torch.sum(mask, dim=1) - 1  # Индекс последнего элемента в каждой последовательности
+        idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)  # Защита от выхода за границу
+        ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden_size]
+
+        if self_att:
+            a, alpha = self.attn(hidden, hidden, mask)  # [batch, hidden_size]
+            a = 0.52 * a + (1 - 0.52) * ht  # Комбинация локального и глобального представления
+        else:
+            q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # [batch, 1, hidden]
+            q2 = self.linear_two(hidden)  # [batch, seq_len, hidden]
+            alpha = self.linear_three(torch.sigmoid(q1 + q2))  # [batch, seq_len, 1]
+            mask_expanded = mask.view(mask.shape[0], -1, 1).float()
+            a = torch.sum(alpha * hidden * mask_expanded, dim=1)
+
+            if not self.nonhybrid:
+                a = self.linear_transform(torch.cat([a, ht], dim=1))  # [batch, hidden]
+
+        b = self.embedding.weight[1:]  # [n_nodes - 1, hidden]
+        scores = torch.matmul(a, b.transpose(1, 0))  # [batch, n_nodes - 1]
+        return scores
+
+#    def forward(self, inputs, A, mask):
+#        hidden = self.embedding(inputs) # Применяем embedding к входам
+#        hidden = self.gnn(A, hidden) # Применяем GNN
+#        attn_output, attn_weights = self.attn(hidden, hidden, mask) # Применяем внимание через LastAttenion
+#        hidden = self.linear_transform(torch.cat([hidden, attn_output], dim=-1)) # Комбинируем скрытые состояния с результатами внимания
+#        return hidden
+
+#    def forward(self, inputs, A, mask):
+#        hidden = self.embedding(inputs)  # [batch, seq_len, hidden] Применяем embedding к входам
+#        hidden = self.gnn(A, hidden)  # [batch, seq_len, hidden] Применяем GNN
+#        attn_output, _ = self.attn(hidden, hidden, mask)  # attn_output: [batch, hidden]
+#        # Получаем последнее скрытое состояние ht
+#        ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # [batch, hidden]
+#        # Комбинируем ht и результат внимания
+#        out = self.linear_transform(torch.cat([attn_output, ht], dim=-1))  # [batch, hidden]
+#        return out
+
+#    def forward(self, inputs, A, mask):
+#        hidden = self.embedding(inputs)  # [batch, seq_len, hidden] # Применяем embedding к входам
+#        hidden = self.gnn(A, hidden)  # [batch, seq_len, hidden] # Применяем GNN
+#        attn_output, _ = self.attn(hidden, hidden, mask)  # attn_output: [batch, hidden] # Применяем модуль внимания (attention)
+#        # Получаем длины последовательностей из маски
+#        lengths = torch.sum(mask, dim=1).long()  # [batch]
+#        # Защищаем от выхода за границы: clamp длину в [1, hidden.size(1)]
+#        #safe_lengths = torch.clamp(lengths, min=1)
+#        #idx = safe_lengths - 1  # итоговые индексы
+#        max_len = hidden.size(1)  # настоящее количество временных шагов после GNN
+#        idx = torch.clamp(lengths - 1, min=0, max=max_len - 1)
+#        # Отладочная информация
+#        print(f"[Debug] hidden: {hidden.shape}")
+#        print(f"[Debug] mask sum (lengths): {lengths}")
+#        print(f"[Debug] idx (clamped to max_len={max_len}): {idx}")
+#        # Безопасно извлекаем последние скрытые состояния
+#        ht = hidden[torch.arange(hidden.size(0)), idx]  # [batch, hidden]
+#        # Комбинируем ht и результат внимания
+#        out = self.linear_transform(torch.cat([attn_output, ht], dim=-1))  # [batch, hidden]
+#        return out
+    # ВМЕСТЕ С ОТЛАДКОЙ
+    """def forward(self, inputs, A, mask):
+        # Эмбеддинг входных токенов
+        hidden = self.embedding(inputs)  # [batch, seq_len, hidden]
+
+        # Пропускаем через графовую нейросеть
+        hidden = self.gnn(A, hidden)  # [batch, seq_len, hidden]
+
+        # Применяем механизм внимания
+        attn_output, _ = self.attn(hidden, hidden, mask)  # attn_output: [batch, hidden]
+
+        # Получаем длину каждой последовательности
+        idx = torch.sum(mask, dim=1) - 1  # Последний активный индекс
+        idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)  # Защита от выхода за границы
+
+        # Извлекаем последнее скрытое состояние
+        ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden]
+
+        # Объединяем внимание и ht (для возможного дальнейшего использования)
+        out = self.linear_transform(torch.cat([attn_output, ht], dim=-1))  # [batch, hidden]
+
+        # 🟡 Возвращаем всю последовательность `hidden` для дальнейшего внимания в `compute_scores`
+        return hidden"""
+
+    # CLEAN VERSION
+    def forward(self, inputs, A, mask):
+        hidden = self.embedding(inputs)  # [batch, seq_len, hidden]
+        hidden = self.gnn(A, hidden)  # [batch, seq_len, hidden]
+        attn_output, _ = self.attn(hidden, hidden, mask)  # [batch, hidden]
+
+        idx = torch.sum(mask, dim=1) - 1  # Последний активный индекс
+        idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)
+        ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden]
+
+        out = self.linear_transform(torch.cat([attn_output, ht], dim=-1))  # [batch, hidden]
+        return hidden
+
+def trans_to_cuda(variable):
+    if torch.cuda.is_available():
+        return variable.cuda()
+    else:
+        return variable
+
+def trans_to_cpu(variable):
+    if torch.cuda.is_available():
+        return variable.cpu()
+    else:
+        return variable
+
+def forward(model, i, data):
+    alias_inputs, A, items, mask, targets = data.get_slice(i)
+    alias_inputs = trans_to_cuda(torch.Tensor(alias_inputs).long())
+    items = trans_to_cuda(torch.Tensor(items).long())
+    A = trans_to_cuda(torch.Tensor(A).float())
+    mask = trans_to_cuda(torch.Tensor(mask).long()) # Здесь мы передаем маску в forward
+    # summary has an embedding bug - https://github.com/jiangxiluning/pytorch-summary
+    # summary(model, [(items.cpu().numpy().shape), (A.cpu().numpy().shape)])  # print model summary
+    # hidden = model(items, A) - # до того, как мы начали передавать mask
+    hidden = model(items, A, mask)  # Передаем mask
+    get = lambda i: hidden[i][alias_inputs[i]]
+    seq_hidden = torch.stack([get(i) for i in torch.arange(len(alias_inputs)).long()])
+    # 加上 position encoding
+    # seq_hidden = model.pe(seq_hidden)
+    # Обновляем mask так же, как seq_hidden
+    mask = torch.stack([mask[i][alias_inputs[i]] for i in range(len(alias_inputs))])
+    return targets, model.compute_scores(seq_hidden, mask)
+
+#def train_test(model, train_data, test_data):
+#    model.scheduler.step()
+#    print('start training: ', datetime.datetime.now())
+#    model.train()
+#    total_loss = 0.0
+#    slices = train_data.generate_batch(model.batch_size)
+#    for i, j in zip(slices, np.arange(len(slices))):
+#        model.optimizer.zero_grad()
+#        targets, scores = forward(model, i, train_data)
+#        targets = trans_to_cuda(torch.Tensor(targets).long())
+#        loss = model.loss_function(scores, targets - 1)
+#        loss.backward()
+#        model.optimizer.step()
+#        total_loss += loss
+#        if j % int(len(slices) / 5 + 1) == 0:
+#            print('[%d/%d] Loss: %.4f' % (j, len(slices), loss.item()))
+#    print('\tLoss:\t%.3f' % total_loss)
+#
+#    print('start predicting: ', datetime.datetime.now())
+#    model.eval()
+#    precision, mrr = [], []
+#    slices = test_data.generate_batch(model.batch_size)
+#    for i in slices:
+#        targets, scores = forward(model, i, test_data)
+#        sub_scores = scores.topk(K)[1]
+#        sub_scores = trans_to_cpu(sub_scores).detach().numpy()
+#        for score, target, mask in zip(sub_scores, targets, test_data.mask):
+#            precision_at_k = np.isin(target - 1, score).sum() / K # Precision@K
+#            precision.append(precision_at_k)  # добавляем в список Precision@K
+#            if len(np.where(score == target - 1)[0]) == 0:
+#                mrr.append(0)
+#            else:
+#                mrr.append(1 / (np.where(score == target - 1)[0][0] + 1))
+#    precision_at_k_mean = np.mean(precision) * 100
+#    mrr_mean = np.mean(mrr) * 100
+#
+#    return precision_at_k_mean, mrr_mean
+
+def train_test(model, train_data, test_data):
+    model.scheduler.step()
+    print('start training: ', datetime.datetime.now())
+    model.train()
+    total_loss = 0.0
+    slices = train_data.generate_batch(model.batch_size)
+
+    for i, j in zip(slices, np.arange(len(slices))):
+        model.optimizer.zero_grad()
+        targets, scores = forward(model, i, train_data)
+
+        print(f"[Debug] scores shape: {scores.shape}")
+        print(f"[Debug] raw targets shape: {targets.shape}")
+
+        # Приводим к тензору и CUDA
+        targets = trans_to_cuda(torch.Tensor(targets).long())
+
+        # Проверка на [batch, 1] — делаем [batch]
+        if targets.dim() > 1:
+            targets = targets.squeeze()
+
+        # Проверка на допустимые значения
+        if (targets < 1).any():
+            print(f"[Error] targets contain 0 or negative values: {targets}")
+            raise ValueError("Invalid target indices: must be >= 1")
+
+        # Теперь безопасно делаем -1 (так как embedding начинается с индекса 1)
+        print(f"[Debug] final targets shape (after -1): {(targets - 1).shape}")
+        loss = model.loss_function(scores, targets - 1)
+
+        loss.backward()
+        model.optimizer.step()
+        total_loss += loss
+
+        if j % int(len(slices) / 5 + 1) == 0:
+            print('[%d/%d] Loss: %.4f' % (j, len(slices), loss.item()))
+
+    print('\tLoss:\t%.3f' % total_loss)
+
+    print('start predicting: ', datetime.datetime.now())
+    model.eval()
+    precision, mrr = [], []
+    slices = test_data.generate_batch(model.batch_size)
+
+    for i in slices:
+        targets, scores = forward(model, i, test_data)
+        sub_scores = scores.topk(K)[1]
+        sub_scores = trans_to_cpu(sub_scores).detach().numpy()
+        for score, target, mask in zip(sub_scores, targets, test_data.mask):
+            precision_at_k = np.isin(target - 1, score).sum() / K
+            precision.append(precision_at_k)
+            if len(np.where(score == target - 1)[0]) == 0:
+                mrr.append(0)
+            else:
+                mrr.append(1 / (np.where(score == target - 1)[0][0] + 1))
+
+    precision_at_k_mean = np.mean(precision) * 100
+    mrr_mean = np.mean(mrr) * 100
+
+    return precision_at_k_mean, mrr_mean
