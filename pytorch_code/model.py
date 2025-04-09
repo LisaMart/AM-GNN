@@ -269,35 +269,90 @@ class SessionGraph(Module):
         # Получаем последний индекс активного элемента
         idx = torch.sum(mask, dim=1) - 1  # Индекс последнего элемента в каждой последовательности
         idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)  # Защита от выхода за границу
+
+        # Получаем последнее скрытое состояние (текущее намерение пользователя)
         ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden_size]
 
         if self_att:
-            a, alpha = self.attn(hidden, hidden, mask)  # [batch, hidden_size]
-            a = 0.52 * a + (1 - 0.52) * ht  # Комбинация локального и глобального представления
+            # Применение механизма внимания с многоголовым вниманием
+            a, alpha = self.attn(hidden, hidden, mask)  # a: [batch_size, hidden_size]; Применяем LastAttenion один раз
+            a = 0.52 * a + (1 - 0.52) * ht  # Комбинируем локальное и глобальное представления (гиперпараметр 0.52)
         else:
+            # Вариант без внимания (оригинальный GC-SAN)
             q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # [batch, 1, hidden]
             q2 = self.linear_two(hidden)  # [batch, seq_len, hidden]
             alpha = self.linear_three(torch.sigmoid(q1 + q2))  # [batch, seq_len, 1]
+
+            # Расчет a с использованием маски
             mask_expanded = mask.view(mask.shape[0], -1, 1).float()
             a = torch.sum(alpha * hidden * mask_expanded, dim=1)
 
             if not self.nonhybrid:
+                # Применение линейного преобразования к результатам
                 a = self.linear_transform(torch.cat([a, ht], dim=1))  # [batch, hidden]
 
+        # Прогноз: [batch, n_nodes - 1]
         b = self.embedding.weight[1:]  # [n_nodes - 1, hidden]
         scores = torch.matmul(a, b.transpose(1, 0))  # [batch, n_nodes - 1]
+
         return scores
 
+    #    def compute_scores(self, hidden, mask, self_att=True, residual=True, k_blocks=4):
+#        # Получаем последний индекс активного элемента
+#        idx = torch.sum(mask, dim=1) - 1  # Индекс последнего элемента в каждой последовательности
+#        idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)  # Защита от выхода за границу
+#        ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden_size]
+#
+#        if self_att:
+#            a, alpha = self.attn(hidden, hidden, mask)  # [batch, hidden_size]
+#            a = 0.52 * a + (1 - 0.52) * ht  # Комбинация локального и глобального представления
+#        else:
+#            q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # [batch, 1, hidden]
+#            q2 = self.linear_two(hidden)  # [batch, seq_len, hidden]
+#            alpha = self.linear_three(torch.sigmoid(q1 + q2))  # [batch, seq_len, 1]
+#            mask_expanded = mask.view(mask.shape[0], -1, 1).float()
+#            a = torch.sum(alpha * hidden * mask_expanded, dim=1)
+#
+#            if not self.nonhybrid:
+#                a = self.linear_transform(torch.cat([a, ht], dim=1))  # [batch, hidden]
+#
+#        b = self.embedding.weight[1:]  # [n_nodes - 1, hidden]
+#        scores = torch.matmul(a, b.transpose(1, 0))  # [batch, n_nodes - 1]
+#        return scores
+
+#    def forward(self, inputs, A, mask):
+#        hidden = self.embedding(inputs)  # [batch, seq_len, hidden]
+#        hidden = self.gnn(A, hidden)  # [batch, seq_len, hidden]
+#        attn_output, _ = self.attn(hidden, hidden, mask)  # [batch, hidden]
+#
+#        idx = torch.sum(mask, dim=1) - 1  # Последний активный индекс
+#        idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)
+#        ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden]
+#
+#        out = self.linear_transform(torch.cat([attn_output, ht], dim=-1))  # [batch, hidden]
+#        return hidden
+
     def forward(self, inputs, A, mask):
+        # Эмбеддинг входных токенов
         hidden = self.embedding(inputs)  # [batch, seq_len, hidden]
+
+        # Пропускаем через графовую нейросеть
         hidden = self.gnn(A, hidden)  # [batch, seq_len, hidden]
+
+        # Применяем механизм внимания (Atten-Mixer)
         attn_output, _ = self.attn(hidden, hidden, mask)  # [batch, hidden]
 
+        # Получаем длину каждой последовательности
         idx = torch.sum(mask, dim=1) - 1  # Последний активный индекс
         idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)
+
+        # Извлекаем последнее скрытое состояние (ht)
         ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden]
 
+        # Объединяем внимание и ht
         out = self.linear_transform(torch.cat([attn_output, ht], dim=-1))  # [batch, hidden]
+
+        # Возвращаем hidden (для compute_scores) — а не out
         return hidden
 
 def trans_to_cuda(variable):
