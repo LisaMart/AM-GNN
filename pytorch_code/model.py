@@ -124,41 +124,61 @@ class MultiHeadedAttention(nn.Module): # Этот слой использует�
         x = x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
         return self.linear_out(x)  # (batch, time1, d_model)
 
-class GNN(Module):
-    def __init__(self, hidden_size, step=1):
-        super(GNN, self).__init__()
+#class GNN(Module):
+#    def __init__(self, hidden_size, step=1):
+#        super(GNN, self).__init__()
+#        self.step = step
+#        self.hidden_size = hidden_size
+#        self.input_size = hidden_size * 2
+#        self.gate_size = 3 * hidden_size
+#        self.w_ih = Parameter(torch.Tensor(self.gate_size, self.input_size))
+#        self.w_hh = Parameter(torch.Tensor(self.gate_size, self.hidden_size))
+#        self.b_ih = Parameter(torch.Tensor(self.gate_size))
+#        self.b_hh = Parameter(torch.Tensor(self.gate_size))
+#        self.b_iah = Parameter(torch.Tensor(self.hidden_size))
+#        self.b_oah = Parameter(torch.Tensor(self.hidden_size))
+#
+#        self.linear_edge_in = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+#        self.linear_edge_out = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+#        self.linear_edge_f = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+#
+#    def GNNCell(self, A, hidden):
+#        input_in = torch.matmul(A[:, :, :A.shape[1]], self.linear_edge_in(hidden)) + self.b_iah
+#        input_out = torch.matmul(A[:, :, A.shape[1]: 2 * A.shape[1]], self.linear_edge_out(hidden)) + self.b_oah
+#        inputs = torch.cat([input_in, input_out], 2)
+#        gi = F.linear(inputs, self.w_ih, self.b_ih)
+#        gh = F.linear(hidden, self.w_hh, self.b_hh)
+#        i_r, i_i, i_n = gi.chunk(3, 2)
+#        h_r, h_i, h_n = gh.chunk(3, 2)
+#        resetgate = torch.sigmoid(i_r + h_r)
+#        inputgate = torch.sigmoid(i_i + h_i)
+#        newgate = torch.tanh(i_n + resetgate * h_n)
+#        hy = hidden - inputgate * (hidden - newgate)
+#        return hy
+#
+#    def forward(self, A, hidden):
+#        for i in range(self.step):
+#            hidden = self.GNNCell(A, hidden)
+#        return hidden
+
+class GNNWithAttention(Module):
+    def __init__(self, hidden_size, step=1, num_heads=8, attention=True):
+        super(GNNWithAttention, self).__init__()
         self.step = step
         self.hidden_size = hidden_size
-        self.input_size = hidden_size * 2
-        self.gate_size = 3 * hidden_size
-        self.w_ih = Parameter(torch.Tensor(self.gate_size, self.input_size))
-        self.w_hh = Parameter(torch.Tensor(self.gate_size, self.hidden_size))
-        self.b_ih = Parameter(torch.Tensor(self.gate_size))
-        self.b_hh = Parameter(torch.Tensor(self.gate_size))
-        self.b_iah = Parameter(torch.Tensor(self.hidden_size))
-        self.b_oah = Parameter(torch.Tensor(self.hidden_size))
+        self.attention = attention
+        self.num_heads = num_heads
+        #self.gnn = GNNWithAttention(hidden_size, heads=opt.heads, step=opt.step)  # Используем GNN с вниманием
+        #self.attn = LastAttenion(self.hidden_size, self.num_heads, step=self.step)  # Используем num_heads
+        #self.attn = MultiHeadedAttention(n_head=num_heads, n_feat=hidden_size, dropout_rate=0.1)
 
-        self.linear_edge_in = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-        self.linear_edge_out = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-        self.linear_edge_f = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        # Используем только LastAttenion для многоголового внимания
+        self.attn = LastAttenion(self.hidden_size, self.num_heads, dot=0.1, l_p=1)  # Параметры можно настроить
 
-    def GNNCell(self, A, hidden):
-        input_in = torch.matmul(A[:, :, :A.shape[1]], self.linear_edge_in(hidden)) + self.b_iah
-        input_out = torch.matmul(A[:, :, A.shape[1]: 2 * A.shape[1]], self.linear_edge_out(hidden)) + self.b_oah
-        inputs = torch.cat([input_in, input_out], 2)
-        gi = F.linear(inputs, self.w_ih, self.b_ih)
-        gh = F.linear(hidden, self.w_hh, self.b_hh)
-        i_r, i_i, i_n = gi.chunk(3, 2)
-        h_r, h_i, h_n = gh.chunk(3, 2)
-        resetgate = torch.sigmoid(i_r + h_r)
-        inputgate = torch.sigmoid(i_i + h_i)
-        newgate = torch.tanh(i_n + resetgate * h_n)
-        hy = hidden - inputgate * (hidden - newgate)
-        return hy
-
-    def forward(self, A, hidden):
-        for i in range(self.step):
-            hidden = self.GNNCell(A, hidden)
+    def forward(self, A, hidden, mask=None):
+        if self.attention:
+            # Применение многоголового внимания
+            hidden, _ = self.attn(hidden, hidden, mask)  # Применяем внимание к скрытым состояниям
         return hidden
 
 class LastAttenion(Module):
@@ -184,7 +204,17 @@ class LastAttenion(Module):
             weight.data.normal_(std=0.1)
 
     def forward(self, ht1, hidden, mask):
+        #print(f"[Debug] LastAttention: hidden shape before unpacking: {hidden.shape}")
         batch_size, seq_len, _ = hidden.size()
+
+        # Добавляем ось времени (если её нет) - предполагаем, что это 1 шаг во времени
+        if len(hidden.size()) == 2:  # [batch_size, hidden_size]
+            #print(f"[Debug] Adding time axis. Before: {hidden.shape}")
+            hidden = hidden.unsqueeze(1)  # Добавляем ось seq_len: [batch_size, 1, hidden_size]
+            #print(f"[Debug] After unsqueeze: {hidden.shape}")
+
+        batch_size, seq_len, _ = hidden.size()  # Теперь у нас есть 3 размерности: [batch_size, seq_len, hidden_size]
+        #print(f"[Debug] After unpacking: batch_size={batch_size}, seq_len={seq_len}, hidden_size={_}")
 
         q0 = self.linear_zero(ht1).view(batch_size, seq_len, self.heads, -1).permute(0, 2, 1, 3)
         q1 = self.linear_one(hidden).view(batch_size, seq_len, self.heads, -1).permute(0, 2, 1, 3)
@@ -193,20 +223,15 @@ class LastAttenion(Module):
         alpha = torch.matmul(q0, q1.transpose(-1, -2)) / (q0.size(-1) ** 0.5)
         alpha = torch.softmax(alpha, dim=-1)
 
-        if self.use_attn_conv == "True":
+        if self.use_attn_conv:
             # Преобразуем alpha для LPPooling
             alpha_reshaped = alpha.view(-1, alpha.size(-2), alpha.size(-1))  # [batch * heads, seq_len, seq_len]
-
-            # Применяем LPPool1d
             pool = torch.nn.LPPool1d(self.l_p, self.last_k, stride=self.last_k)
             alpha_pooled = pool(alpha_reshaped)  # [batch * heads, seq_len, pooled_len]
-
-            # Восстановим размерность после pooling
             pooled_len = alpha_pooled.size(-1)
             alpha = alpha_pooled.view(batch_size, self.heads, seq_len, pooled_len)
 
-            # Приведение маски к нужной форме
-            extended_mask = mask[:, :seq_len].unsqueeze(1).unsqueeze(-1)  # [batch, 1, seq_len, 1]
+            extended_mask = mask[:, :seq_len].unsqueeze(1).unsqueeze(-1)
             alpha = alpha * extended_mask  # Применяем маску
 
             # Нормализация
@@ -215,11 +240,11 @@ class LastAttenion(Module):
             # Обновление q2, чтобы он соответствовал pooled_len
             q2 = q2[..., -pooled_len:, :]  # Обрезаем последние pooled_len элементов
 
-            # Применение внимания
-            out = torch.matmul(alpha, q2)
-        else:
-            # Применение обычного внимания
-            out = torch.matmul(alpha, q2)
+#            # Применение внимания
+#            out = torch.matmul(alpha, q2)
+#        else:
+#            # Применение обычного внимания
+#            out = torch.matmul(alpha, q2)
 
         out = torch.matmul(alpha, q2)
         out = out.permute(0, 2, 1, 3).contiguous()
@@ -234,30 +259,39 @@ class LastAttenion(Module):
 
         return a, alpha
 
-class SessionGraph(Module):
+class SessionGraphWithAttention(Module):
     def __init__(self, opt, n_node, len_max):
-        super(SessionGraph, self).__init__()
+        super(SessionGraphWithAttention, self).__init__()
         self.hidden_size = opt.hiddenSize
-        self.len_max = len_max # Максимальная длина для позиционного кодирования
+        self.len_max = len_max
         self.n_node = n_node
         self.batch_size = opt.batchSize
-        self.num_heads = opt.heads # new - добавляем количество голов head
-        self.nonhybrid = opt.nonhybrid
+        self.num_heads = opt.heads
         self.embedding = nn.Embedding(self.n_node, self.hidden_size)
-        self.gnn = GNN(self.hidden_size, step=opt.step)
 
-        self.attn = LastAttenion(self.hidden_size, self.num_heads, opt.dot, opt.l_p, last_k=opt.last_k, use_attn_conv=opt.use_attn_conv)# Инициализация слоя внимания LastAttenion
+        # Используем GNNWithAttention
+        self.gnn_with_attention = GNNWithAttention(self.hidden_size, step=opt.step, num_heads=self.num_heads)
 
+        # Слой внимания
+        self.attn = LastAttenion(self.hidden_size, self.num_heads, dot=opt.dot, l_p=opt.l_p, last_k=opt.last_k, use_attn_conv=opt.use_attn_conv)
+
+        # Линейные преобразования и другие слои
         self.linear_one = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_two = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_three = nn.Linear(self.hidden_size, 1, bias=False)
         self.linear_transform = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=True)
+
+        # Прочие слои
         self.rn = Residual()
         self.multihead_attn = nn.MultiheadAttention(self.hidden_size, 1).cuda()
         self.pe = PositionEmbedding(len_max, self.hidden_size)
+
+        # Функция потерь и оптимизатор
         self.loss_function = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
+
+        # Инициализация параметров
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -269,13 +303,14 @@ class SessionGraph(Module):
         # Получаем последний индекс активного элемента
         idx = torch.sum(mask, dim=1) - 1  # Индекс последнего элемента в каждой последовательности
         idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)  # Защита от выхода за границу
-
+#        print(f"[Debug] SessionGraphWithAttention: hidden shape before unpacking: {hidden.shape}")
         # Получаем последнее скрытое состояние (текущее намерение пользователя)
         ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden_size]
 
         if self_att:
             # Применение механизма внимания с многоголовым вниманием
-            a, alpha = self.attn(hidden, hidden, mask)  # a: [batch_size, hidden_size]; Применяем LastAttenion один раз
+           # a, alpha = self.gnn_with_attention.attn(hidden, hidden, mask)  # a: [batch_size, hidden_size]; Применяем LastAttenion один раз
+            a, alpha = self.attn(hidden, hidden, mask)  # Apply LastAttenion
             a = 0.52 * a + (1 - 0.52) * ht  # Комбинируем локальное и глобальное представления (гиперпараметр 0.52)
         else:
             # Вариант без внимания (оригинальный GC-SAN)
@@ -297,64 +332,119 @@ class SessionGraph(Module):
 
         return scores
 
-    #    def compute_scores(self, hidden, mask, self_att=True, residual=True, k_blocks=4):
+    def forward(self, inputs, A, mask):
+        hidden = self.embedding(inputs)  # Применяем embedding к входным данным
+        #print(f"[Debug] After embedding: hidden shape: {hidden.shape}")
+
+        # Пропускаем через GNN с многоголовым вниманием
+        hidden = self.gnn_with_attention(A, hidden, mask)
+        #print(f"[Debug] After GNN with attention: hidden shape: {hidden.shape}")
+
+        # Добавление оси времени, если её нет
+        if len(hidden.size()) == 2:  # [batch_size, hidden_size]
+            hidden = hidden.unsqueeze(1)  # Добавляем ось seq_len: [batch_size, 1, hidden_size]
+
+        # Применяем внимание
+        #attn_output, _ = self.gnn_with_attention.attn(hidden, hidden, mask)
+        attn_output, _ = self.attn(hidden, hidden, mask)
+
+        # Получаем последнее скрытое состояние
+        idx = torch.sum(mask, dim=1) - 1
+        idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)
+        ht = hidden[torch.arange(hidden.size(0)).long(), idx]
+        #print(f"[Debug] After extracting last hidden state: ht shape: {ht.shape}")
+
+        out = self.linear_transform(torch.cat([attn_output, ht], dim=-1))  # Объединяем внимание и скрытое состояние
+        #print(f"[Debug] After linear transform: out shape: {out.shape}")
+
+        return hidden
+
+#class SessionGraph(Module):
+#    def __init__(self, opt, n_node, len_max):
+#        super(SessionGraph, self).__init__()
+#        self.hidden_size = opt.hiddenSize
+#        self.len_max = len_max # Максимальная длина для позиционного кодирования
+#        self.n_node = n_node
+#        self.batch_size = opt.batchSize
+#        self.num_heads = opt.heads # new - добавляем количество голов head
+#        self.nonhybrid = opt.nonhybrid
+#        self.embedding = nn.Embedding(self.n_node, self.hidden_size)
+#        self.gnn = GNN(self.hidden_size, step=opt.step)
+#
+#        self.attn = LastAttenion(self.hidden_size, self.num_heads, opt.dot, opt.l_p, last_k=opt.last_k, use_attn_conv=opt.use_attn_conv)# Инициализация слоя внимания LastAttenion
+#
+#        self.linear_one = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+#        self.linear_two = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+#        self.linear_three = nn.Linear(self.hidden_size, 1, bias=False)
+#        self.linear_transform = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=True)
+#        self.rn = Residual()
+#        self.multihead_attn = nn.MultiheadAttention(self.hidden_size, 1).cuda()
+#        self.pe = PositionEmbedding(len_max, self.hidden_size)
+#        self.loss_function = nn.CrossEntropyLoss()
+#        self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
+#        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
+#        self.reset_parameters()
+#
+#    def reset_parameters(self):
+#        stdv = 1.0 / math.sqrt(self.hidden_size)
+#        for weight in self.parameters():
+#            weight.data.uniform_(-stdv, stdv)
+#
+#    def compute_scores(self, hidden, mask, self_att=True, residual=True, k_blocks=4):
 #        # Получаем последний индекс активного элемента
 #        idx = torch.sum(mask, dim=1) - 1  # Индекс последнего элемента в каждой последовательности
 #        idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)  # Защита от выхода за границу
+#
+#        # Получаем последнее скрытое состояние (текущее намерение пользователя)
 #        ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden_size]
 #
 #        if self_att:
-#            a, alpha = self.attn(hidden, hidden, mask)  # [batch, hidden_size]
-#            a = 0.52 * a + (1 - 0.52) * ht  # Комбинация локального и глобального представления
+#            # Применение механизма внимания с многоголовым вниманием
+#            a, alpha = self.attn(hidden, hidden, mask)  # a: [batch_size, hidden_size]; Применяем LastAttenion один раз
+#            a = 0.52 * a + (1 - 0.52) * ht  # Комбинируем локальное и глобальное представления (гиперпараметр 0.52)
 #        else:
+#            # Вариант без внимания (оригинальный GC-SAN)
 #            q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # [batch, 1, hidden]
 #            q2 = self.linear_two(hidden)  # [batch, seq_len, hidden]
 #            alpha = self.linear_three(torch.sigmoid(q1 + q2))  # [batch, seq_len, 1]
+#
+#            # Расчет a с использованием маски
 #            mask_expanded = mask.view(mask.shape[0], -1, 1).float()
 #            a = torch.sum(alpha * hidden * mask_expanded, dim=1)
 #
 #            if not self.nonhybrid:
+#                # Применение линейного преобразования к результатам
 #                a = self.linear_transform(torch.cat([a, ht], dim=1))  # [batch, hidden]
 #
+#        # Прогноз: [batch, n_nodes - 1]
 #        b = self.embedding.weight[1:]  # [n_nodes - 1, hidden]
 #        scores = torch.matmul(a, b.transpose(1, 0))  # [batch, n_nodes - 1]
+#
 #        return scores
-
+#
 #    def forward(self, inputs, A, mask):
+#        # Эмбеддинг входных токенов
 #        hidden = self.embedding(inputs)  # [batch, seq_len, hidden]
+#
+#        # Пропускаем через графовую нейросеть
 #        hidden = self.gnn(A, hidden)  # [batch, seq_len, hidden]
+#
+#        # Применяем механизм внимания (Atten-Mixer)
 #        attn_output, _ = self.attn(hidden, hidden, mask)  # [batch, hidden]
 #
+#        # Получаем длину каждой последовательности
 #        idx = torch.sum(mask, dim=1) - 1  # Последний активный индекс
 #        idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)
+#
+#        # Извлекаем последнее скрытое состояние (ht)
 #        ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden]
 #
+#        # Объединяем внимание и ht
 #        out = self.linear_transform(torch.cat([attn_output, ht], dim=-1))  # [batch, hidden]
+#
+#        # Возвращаем hidden (для compute_scores) — а не out
 #        return hidden
-
-    def forward(self, inputs, A, mask):
-        # Эмбеддинг входных токенов
-        hidden = self.embedding(inputs)  # [batch, seq_len, hidden]
-
-        # Пропускаем через графовую нейросеть
-        hidden = self.gnn(A, hidden)  # [batch, seq_len, hidden]
-
-        # Применяем механизм внимания (Atten-Mixer)
-        attn_output, _ = self.attn(hidden, hidden, mask)  # [batch, hidden]
-
-        # Получаем длину каждой последовательности
-        idx = torch.sum(mask, dim=1) - 1  # Последний активный индекс
-        idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)
-
-        # Извлекаем последнее скрытое состояние (ht)
-        ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden]
-
-        # Объединяем внимание и ht
-        out = self.linear_transform(torch.cat([attn_output, ht], dim=-1))  # [batch, hidden]
-
-        # Возвращаем hidden (для compute_scores) — а не out
-        return hidden
-
+#
 def trans_to_cuda(variable):
     if torch.cuda.is_available():
         return variable.cuda()
@@ -374,6 +464,22 @@ def forward(model, i, data):
     A = trans_to_cuda(torch.Tensor(A).float())
     mask = trans_to_cuda(torch.Tensor(mask).long()) # Здесь мы передаем маску в forward
     hidden = model(items, A, mask)  # Передаем mask
+
+    # Проверка на индексы выходящие за пределы
+    max_seq_len = hidden.size(1)  # Должен быть равен 6 (для последовательности длиной 6)
+
+    # Проверим, не выходят ли индексы за пределы
+    alias_inputs = torch.clamp(alias_inputs, max=max_seq_len - 1)  # Принудительно обрезаем индексы
+
+    # Отладочная строка: проверяем допустимость индексов
+    #print(f"[Debug] alias_inputs: {alias_inputs}")
+    #print(f"[Debug] hidden size: {hidden.size()}")
+
+    # Проверка, что индексы находятся в допустимом диапазоне
+    if (alias_inputs >= hidden.size(1)).any():
+        print(f"[Error] alias_inputs contains indices out of bounds!")
+        return targets, None  # Возвращаем None, чтобы избежать дальнейших ошибок
+
     get = lambda i: hidden[i][alias_inputs[i]]
     seq_hidden = torch.stack([get(i) for i in torch.arange(len(alias_inputs)).long()])
     mask = torch.stack([mask[i][alias_inputs[i]] for i in range(len(alias_inputs))])

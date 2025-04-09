@@ -56,7 +56,7 @@ def main():
     else:
         n_node = 310
 
-    model = trans_to_cuda(SessionGraph(opt, n_node, max(train_data.len_max, test_data.len_max)))
+    model = trans_to_cuda(SessionGraphWithAttention(opt, n_node, max(train_data.len_max, test_data.len_max)))
 
     start = time.time()
     best_result = [0, 0]
