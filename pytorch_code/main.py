@@ -42,11 +42,8 @@ def main():
 
     print(f"Размер выборки для тренировки: {len(train_data)}")
 
-    # all_train_seq = pickle.load(open('../datasets/' + opt.dataset + '/all_train_seq.txt', 'rb'))
-    # g = build_graph(all_train_seq)
     train_data = Data(train_data, shuffle=True, opt=opt)
     test_data = Data(test_data, shuffle=False, opt=opt)
-    # del all_train_seq, g
     if opt.dataset == 'diginetica':
         n_node = 43098
     elif opt.dataset == 'yoochoose1_64' or opt.dataset == 'yoochoose1_4':
