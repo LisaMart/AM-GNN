@@ -383,6 +383,8 @@ class MultiLevelAttention(Module):
         alpha = torch.matmul(q0, q1.transpose(-1, -2)) / (q0.size(-1) ** 0.5)
         alpha = torch.softmax(alpha, dim=-1)
 
+        self.alpha = alpha # Сохраняем alpha как атрибут для регуляризации в других частях модели
+
         if self.use_attn_conv:
             # Преобразуем alpha для LPPooling
             alpha_reshaped = alpha.view(-1, alpha.size(-2), alpha.size(-1))  # [batch * heads, seq_len, seq_len]
@@ -591,6 +593,35 @@ class SessionGraphWithMultiLevelAttention(Module):
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
+#    def compute_scores(self, hidden, mask, self_att=True, residual=True, k_blocks=4):
+#        # Логика вычисления оценок остаётся без изменений
+#        idx = torch.sum(mask, dim=1) - 1  # Индекс последнего элемента в каждой последовательности
+#        idx = torch.clamp(idx, min=0, max=hidden.size(1) - 1)
+#        ht = hidden[torch.arange(hidden.size(0)).long(), idx]  # [batch, hidden_size]
+#
+#        if self_att:
+#            # Применяем многослойное внимание
+#            a, alpha = self.multi_level_attn(hidden, hidden, mask)  # Используем новый слой внимания
+#            a = 0.52 * a + (1 - 0.52) * ht
+#        else:
+#            # Вариант без внимания
+#            q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # [batch, 1, hidden]
+#            q2 = self.linear_two(hidden)  # [batch, seq_len, hidden]
+#            alpha = self.linear_three(torch.sigmoid(q1 + q2))  # [batch, seq_len, 1]
+#
+#            # Маска
+#            mask_expanded = mask.view(mask.shape[0], -1, 1).float()
+#            a = torch.sum(alpha * hidden * mask_expanded, dim=1)
+#
+#            if not self.nonhybrid:
+#                a = self.linear_transform(torch.cat([a, ht], dim=1))  # Применяем линейное преобразование
+#
+#        # Прогноз
+#        b = self.embedding.weight[1:]  # [n_nodes - 1, hidden]
+#        scores = torch.matmul(a, b.transpose(1, 0))  # [batch, n_nodes - 1]
+#
+#        return scores
+
     def compute_scores(self, hidden, mask, self_att=True, residual=True, k_blocks=4):
         # Логика вычисления оценок остаётся без изменений
         idx = torch.sum(mask, dim=1) - 1  # Индекс последнего элемента в каждой последовательности
@@ -620,6 +651,18 @@ class SessionGraphWithMultiLevelAttention(Module):
         scores = torch.matmul(a, b.transpose(1, 0))  # [batch, n_nodes - 1]
 
         return scores
+
+    # Изменение функции потерь
+    def loss_function(self, scores, targets):
+        # Перекрёстная энтропия для классификационной задачи
+        loss = torch.nn.CrossEntropyLoss()(scores, targets)
+
+        # Регуляризация внимания (например, на основе alpha)
+        # Можно добавить регуляризацию на alpha, чтобы не позволить модели слишком сильно полагаться на конкретные элементы внимания
+        attn_regularization = torch.mean(torch.abs(self.multi_level_attn.alpha))
+        loss += 0.01 * attn_regularization  # Параметр регуляризации можно подбирать
+
+        return loss
 
     def forward(self, inputs, A, mask):
         hidden = self.embedding(inputs)  # Применяем embedding к входным данным
